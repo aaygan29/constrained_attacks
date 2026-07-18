@@ -1,0 +1,195 @@
+
+# First, let me build the complete code properly - this will be a large file
+# I'll structure it carefully and write it in parts
+
+part1 = '''#!/usr/bin/env python3
+"""
+================================================================================
+MULTI-LEVEL ADVERSARIAL PROTEIN EDITING FRAMEWORK — PRODUCTION VERSION v2.0
+================================================================================
+A fully runnable Proto-structured pipeline for evaluating classifier robustness
+against biologically constrained adversarial protein edits.
+
+Based on: Krishnan et al. (2026) "Adversarial Genomic Sequences Could Evade 
+Biosecurity Screening" (IEEE S&P Workshop) and Fan et al. (2025) "SafeProtein"
+arXiv:2509.03487.
+
+SEARCH STRATEGY: Beam search (as per Krishnan/Fan papers), with genetic algorithm
+fallback for black-box settings.
+
+ENVIRONMENT: Designed for Jupyter, Google Colab, and standard Python execution.
+All heavy computations have lightweight proxies. All constraints degrade gracefully
+when data is missing.
+
+INSTALLATION:
+    pip install fair-esm biopython numpy scipy scikit-learn torch transformers
+    
+    # Optional (for full structural features):
+    pip install "fair-esm[esmfold]"
+    
+    # DSSP (for secondary structure):
+    # Ubuntu: sudo apt-get install dssp
+    # macOS: brew install dssp
+
+CITATIONS: See FULL_CITATIONS at bottom.
+================================================================================
+"""
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Callable, Set, Any
+from enum import Enum
+from abc import ABC, abstractmethod
+import warnings
+import json
+import os
+import heapq
+from collections import defaultdict, Counter
+import copy
+
+# Try to import optional dependencies
+try:
+    import esm
+    from esm import pretrained
+    ESM_AVAILABLE = True
+except ImportError:
+    ESM_AVAILABLE = False
+    warnings.warn("fair-esm not installed. ESM2 features will use fallback heuristics.")
+
+try:
+    from Bio.PDB import PDBParser, DSSP
+    from Bio.PDB.PDBList import PDBList
+    BIOPYTHON_AVAILABLE = True
+except ImportError:
+    BIOPYTHON_AVAILABLE = False
+    warnings.warn("Biopython not installed. DSSP features will use fallback.")
+
+
+# ==============================================================================
+# SECTION 0: CONSTANTS AND DATA TABLES
+# ==============================================================================
+
+AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+AA_SET = set(AMINO_ACIDS)
+AA_LIST = list(AMINO_ACIDS)
+
+# Kyte-Doolittle hydropathy index
+# Reference: Kyte & Doolittle (1982)
+HYDROPATHY = {
+    'A': 1.80, 'C': 2.50, 'D': -3.50, 'E': -3.50, 'F': 2.80,
+    'G': -0.40, 'H': -3.20, 'I': 4.50, 'K': -3.90, 'L': 3.80,
+    'M': 1.90, 'N': -3.50, 'P': -1.60, 'Q': -3.50, 'R': -4.50,
+    'S': -0.80, 'T': -0.70, 'V': 4.20, 'W': -0.90, 'Y': -1.30
+}
+
+# Full Grantham chemical distance matrix
+# Reference: Grantham (1974)
+GRANTHAM = {
+    'A': {'A':0,'C':195,'D':126,'E':107,'F':113,'G':60,'H':86,'I':94,'K':106,'L':96,'M':84,'N':111,'P':27,'Q':91,'R':112,'S':99,'T':58,'V':64,'W':148,'Y':112},
+    'C': {'A':195,'C':0,'D':154,'E':170,'F':205,'G':159,'H':174,'I':198,'K':202,'L':198,'M':196,'N':139,'P':169,'Q':154,'R':180,'S':112,'T':81,'V':192,'W':215,'Y':194},
+    'D': {'A':126,'C':154,'D':0,'E':45,'F':177,'G':94,'H':101,'I':168,'K':101,'L':172,'M':160,'N':23,'P':108,'Q':61,'R':96,'S':65,'T':85,'V':152,'W':181,'Y':160},
+    'E': {'A':107,'C':170,'D':45,'E':0,'F':140,'G':98,'H':83,'I':134,'K':56,'L':138,'M':126,'N':42,'P':93,'Q':29,'R':54,'S':80,'T':65,'V':121,'W':152,'Y':122},
+    'F': {'A':113,'C':205,'D':177,'E':140,'F':0,'G':153,'H':100,'I':21,'K':102,'L':22,'M':28,'N':158,'P':114,'Q':116,'R':97,'S':155,'T':134,'V':50,'W':40,'Y':22},
+    'G': {'A':60,'C':159,'D':94,'E':98,'F':153,'G':0,'H':98,'I':135,'K':127,'L':138,'M':127,'N':80,'P':42,'Q':87,'R':125,'S':56,'T':59,'V':109,'W':184,'Y':147},
+    'H': {'A':86,'C':174,'D':101,'E':83,'F':100,'G':98,'H':0,'I':94,'K':32,'L':99,'M':87,'N':68,'P':77,'Q':24,'R':29,'S':81,'T':47,'V':84,'W':115,'Y':83},
+    'I': {'A':94,'C':198,'D':168,'E':134,'F':21,'G':135,'H':94,'I':0,'K':102,'L':5,'M':10,'N':149,'P':95,'Q':109,'R':97,'S':142,'T':89,'V':29,'W':61,'Y':33},
+    'K': {'A':106,'C':202,'D':101,'E':56,'F':102,'G':127,'H':32,'I':102,'K':0,'L':107,'M':95,'N':94,'P':103,'Q':53,'R':26,'S':121,'T':78,'V':97,'W':110,'Y':85},
+    'L': {'A':96,'C':198,'D':172,'E':138,'F':22,'G':138,'H':99,'I':5,'K':107,'L':0,'M':15,'N':153,'P':98,'Q':113,'R':102,'S':145,'T':92,'V':32,'W':61,'Y':36},
+    'M': {'A':84,'C':196,'D':160,'E':126,'F':28,'G':127,'H':87,'I':10,'K':95,'L':15,'M':0,'N':142,'P':87,'Q':101,'R':91,'S':135,'T':81,'V':21,'W':67,'Y':36},
+    'N': {'A':111,'C':139,'D':23,'E':42,'F':158,'G':80,'H':68,'I':149,'K':94,'L':153,'M':142,'N':0,'P':91,'Q':46,'R':86,'S':46,'T':65,'V':133,'W':174,'Y':143},
+    'P': {'A':27,'C':169,'D':108,'E':93,'F':114,'G':42,'H':77,'I':95,'K':103,'L':98,'M':87,'N':91,'P':0,'Q':76,'R':103,'S':74,'T':38,'V':68,'W':147,'Y':110},
+    'Q': {'A':91,'C':154,'D':61,'E':29,'F':116,'G':87,'H':24,'I':109,'K':53,'L':113,'M':101,'N':46,'P':76,'Q':0,'R':43,'S':68,'T':42,'V':96,'W':130,'Y':99},
+    'R': {'A':112,'C':180,'D':96,'E':54,'F':97,'G':125,'H':29,'I':97,'K':26,'L':102,'M':91,'N':86,'P':103,'Q':43,'R':0,'S':110,'T':71,'V':96,'W':101,'Y':77},
+    'S': {'A':99,'C':112,'D':65,'E':80,'F':155,'G':56,'H':81,'I':142,'K':121,'L':145,'M':135,'N':46,'P':74,'Q':68,'R':110,'S':0,'T':58,'V':124,'W':177,'Y':144},
+    'T': {'A':58,'C':81,'D':85,'E':65,'F':134,'G':59,'H':47,'I':89,'K':78,'L':92,'M':81,'N':65,'P':38,'Q':42,'R':71,'S':58,'T':0,'V':69,'W':128,'Y':92},
+    'V': {'A':64,'C':192,'D':152,'E':121,'F':50,'G':109,'H':84,'I':29,'K':97,'L':32,'M':21,'N':133,'P':68,'Q':96,'R':96,'S':124,'T':69,'V':0,'W':88,'Y':55},
+    'W': {'A':148,'C':215,'D':181,'E':152,'F':40,'G':184,'H':115,'I':61,'K':110,'L':61,'M':67,'N':174,'P':147,'Q':130,'R':101,'S':177,'T':128,'V':88,'W':0,'Y':37},
+    'Y': {'A':112,'C':194,'D':160,'E':122,'F':22,'G':147,'H':83,'I':33,'K':85,'L':36,'M':36,'N':143,'P':110,'Q':99,'R':77,'S':144,'T':92,'V':55,'W':37,'Y':0}
+}
+
+# BLOSUM62 substitution matrix
+# Reference: Henikoff & Henikoff (1992)
+BLOSUM62 = {
+    'A': {'A':4,'R':-1,'N':-2,'D':-2,'C':0,'Q':-1,'E':-1,'G':0,'H':-2,'I':-1,'L':-1,'K':-1,'M':-1,'F':-2,'P':-1,'S':1,'T':0,'W':-3,'Y':-2,'V':0},
+    'R': {'A':-1,'R':5,'N':0,'D':-2,'C':-3,'Q':1,'E':0,'G':-2,'H':0,'I':-3,'L':-2,'K':2,'M':-1,'F':-3,'P':-2,'S':-1,'T':-1,'W':-3,'Y':-2,'V':-3},
+    'N': {'A':-2,'R':0,'N':6,'D':1,'C':-3,'Q':0,'E':0,'G':0,'H':1,'I':-3,'L':-3,'K':0,'M':-2,'F':-3,'P':-2,'S':1,'T':0,'W':-4,'Y':-2,'V':-3},
+    'D': {'A':-2,'R':-2,'N':1,'D':6,'C':-3,'Q':0,'E':2,'G':-1,'H':-1,'I':-3,'L':-4,'K':-1,'M':-3,'F':-3,'P':-1,'S':0,'T':-1,'W':-4,'Y':-3,'V':-3},
+    'C': {'A':0,'R':-3,'N':-3,'D':-3,'C':9,'Q':-3,'E':-4,'G':-3,'H':-3,'I':-1,'L':-1,'K':-3,'M':-1,'F':-2,'P':-3,'S':-1,'T':-1,'W':-2,'Y':-2,'V':-1},
+    'Q': {'A':-1,'R':1,'N':0,'D':0,'C':-3,'Q':5,'E':2,'G':-2,'H':0,'I':-3,'L':-2,'K':1,'M':0,'F':-3,'P':-1,'S':0,'T':-1,'W':-2,'Y':-1,'V':-2},
+    'E': {'A':-1,'R':0,'N':0,'D':2,'C':-4,'Q':2,'E':5,'G':-2,'H':0,'I':-3,'L':-3,'K':1,'M':-2,'F':-3,'P':-1,'S':0,'T':-1,'W':-3,'Y':-2,'V':-2},
+    'G': {'A':0,'R':-2,'N':0,'D':-1,'C':-3,'Q':-2,'E':-2,'G':6,'H':-2,'I':-4,'L':-4,'K':-2,'M':-3,'F':-3,'P':-2,'S':0,'T':-2,'W':-2,'Y':-3,'V':-3},
+    'H': {'A':-2,'R':0,'N':1,'D':-1,'C':-3,'Q':0,'E':0,'G':-2,'H':8,'I':-3,'L':-3,'K':-1,'M':-2,'F':-1,'P':-2,'S':-1,'T':-2,'W':-2,'Y':2,'V':-3},
+    'I': {'A':-1,'R':-3,'N':-3,'D':-3,'C':-1,'Q':-3,'E':-3,'G':-4,'H':-3,'I':4,'L':2,'K':-3,'M':1,'F':0,'P':-3,'S':-2,'T':-1,'W':-3,'Y':-1,'V':3},
+    'L': {'A':-1,'R':-2,'N':-3,'D':-4,'C':-1,'Q':-2,'E':-3,'G':-4,'H':-3,'I':2,'L':4,'K':-2,'M':2,'F':0,'P':-3,'S':-2,'T':-1,'W':-2,'Y':-1,'V':1},
+    'K': {'A':-1,'R':2,'N':0,'D':-1,'C':-3,'Q':1,'E':1,'G':-2,'H':-1,'I':-3,'L':-2,'K':5,'M':-1,'F':-3,'P':-1,'S':0,'T':-1,'W':-3,'Y':-2,'V':-2},
+    'M': {'A':-1,'R':-1,'N':-2,'D':-3,'C':-1,'Q':0,'E':-2,'G':-3,'H':-2,'I':1,'L':2,'K':-1,'M':5,'F':0,'P':-2,'S':-1,'T':-1,'W':-1,'Y':-1,'V':1},
+    'F': {'A':-2,'R':-3,'N':-3,'D':-3,'C':-2,'Q':-3,'E':-3,'G':-3,'H':-1,'I':0,'L':0,'K':-3,'M':0,'F':6,'P':-4,'S':-2,'T':-2,'W':1,'Y':3,'V':-1},
+    'P': {'A':-1,'R':-2,'N':-2,'D':-1,'C':-3,'Q':-1,'E':-1,'G':-2,'H':-2,'I':-3,'L':-3,'K':-1,'M':-2,'F':-4,'P':7,'S':-1,'T':-1,'W':-4,'Y':-3,'V':-2},
+    'S': {'A':1,'R':-1,'N':1,'D':0,'C':-1,'Q':0,'E':0,'G':0,'H':-1,'I':-2,'L':-2,'K':0,'M':-1,'F':-2,'P':-1,'S':4,'T':1,'W':-3,'Y':-2,'V':-2},
+    'T': {'A':0,'R':-1,'N':0,'D':-1,'C':-1,'Q':-1,'E':-1,'G':-2,'H':-2,'I':-1,'L':-1,'K':-1,'M':-1,'F':-2,'P':-1,'S':1,'T':5,'W':-2,'Y':-2,'V':0},
+    'W': {'A':-3,'R':-3,'N':-4,'D':-4,'C':-2,'Q':-2,'E':-3,'G':-2,'H':-2,'I':-3,'L':-2,'K':-3,'M':-1,'F':1,'P':-4,'S':-3,'T':-2,'W':11,'Y':2,'V':-3},
+    'Y': {'A':-2,'R':-2,'N':-2,'D':-3,'C':-2,'Q':-1,'E':-2,'G':-3,'H':2,'I':-1,'L':-1,'K':-2,'M':-1,'F':3,'P':-3,'S':-2,'T':-2,'W':2,'Y':7,'V':-1},
+    'V': {'A':0,'R':-3,'N':-3,'D':-3,'C':-1,'Q':-2,'E':-2,'G':-3,'H':-3,'I':3,'L':1,'K':-2,'M':1,'F':-1,'P':-2,'S':-2,'T':0,'W':-3,'Y':-1,'V':4}
+}
+
+# Chou-Fasman secondary structure propensities (P_α, P_β, P_turn)
+# Reference: Chou & Fasman (1974)
+CHOU_FASMAN = {
+    'A': (1.45, 0.97, 0.66), 'C': (0.77, 1.30, 0.54), 'D': (0.98, 0.80, 1.46),
+    'E': (1.53, 0.26, 0.74), 'F': (1.12, 1.28, 0.60), 'G': (0.53, 0.81, 1.56),
+    'H': (1.24, 0.71, 0.95), 'I': (1.00, 1.60, 0.47), 'K': (1.07, 0.74, 1.01),
+    'L': (1.34, 1.22, 0.57), 'M': (1.20, 1.67, 0.47), 'N': (0.73, 0.65, 1.49),
+    'P': (0.59, 0.62, 1.52), 'Q': (1.17, 1.23, 0.75), 'R': (0.79, 0.90, 0.93),
+    'S': (0.75, 0.72, 1.43), 'T': (0.82, 1.20, 0.96), 'V': (0.91, 1.87, 0.41),
+    'W': (1.14, 1.19, 0.75), 'Y': (0.76, 1.45, 0.76)
+}
+
+# Aggregation propensity scale (TANGO-inspired)
+# Reference: Tartaglia et al. (2008)
+AGGREGATION = {
+    'A': 0.30, 'C': 0.50, 'D': 0.10, 'E': 0.10, 'F': 0.80,
+    'G': 0.20, 'H': 0.40, 'I': 0.90, 'K': 0.10, 'L': 0.80,
+    'M': 0.60, 'N': 0.20, 'P': 0.00, 'Q': 0.30, 'R': 0.10,
+    'S': 0.20, 'T': 0.30, 'V': 0.80, 'W': 0.70, 'Y': 0.70
+}
+
+# Residue accessible surface area (Å²) — Sander & Rost (1994)
+MAX_ASA = {
+    'A': 106.0, 'C': 135.0, 'D': 163.0, 'E': 194.0, 'F': 197.0,
+    'G': 84.0, 'H': 184.0, 'I': 169.0, 'K': 205.0, 'L': 164.0,
+    'M': 188.0, 'N': 157.0, 'P': 136.0, 'Q': 189.0, 'R': 248.0,
+    'S': 130.0, 'T': 142.0, 'V': 142.0, 'W': 227.0, 'Y': 222.0
+}
+
+# Amino acid volume (Å³) — for packing analysis
+AA_VOLUME = {
+    'A': 88.6, 'C': 108.5, 'D': 111.1, 'E': 138.4, 'F': 189.9,
+    'G': 60.1, 'H': 153.2, 'I': 166.7, 'K': 168.6, 'L': 166.7,
+    'M': 162.9, 'N': 114.1, 'P': 112.7, 'Q': 143.8, 'R': 173.4,
+    'S': 89.0, 'T': 116.1, 'V': 140.0, 'W': 227.8, 'Y': 193.6
+}
+
+# PTM amino acid preferences
+PTM_PREFERENCES = {
+    'phosphorylation': set('STY'),
+    'glycosylation_N': set('N'),  # Asn-X-Ser/Thr
+    'glycosylation_O': set('ST'),
+    'ubiquitination': set('K'),
+    'acetylation': set('K'),
+    'methylation': set('KR')
+}
+
+# DSSP 8-state to 3-state mapping
+DSSP_3STATE = {
+    'H': 'H', 'G': 'H', 'I': 'H',  # Helix
+    'E': 'E', 'B': 'E',             # Sheet
+    'T': 'C', 'S': 'C', 'C': 'C', '-': 'C'  # Coil
+}
+'''
+
+with open('/mnt/agents/output/adversarial_protein_framework_v2.py', 'w') as f:
+    f.write(part1)
+
+print(f"Part 1 written: {len(part1)} chars")
