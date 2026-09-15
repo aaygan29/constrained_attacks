@@ -61,7 +61,7 @@ No dataset ships with this repo; it operates on sequences you supply.
 
 ## Context
 
-Built for a PRISM AI-safety fellowship team project on biologically grounded adversarial robustness of protein foundation models. It is the applied successor to [`bioplausibility_scoring`](https://github.com/aaygan29/bioplausibility_scoring), which separated *bioplausibility* from *functional viability* as scores; this framework turns that separation into a tiered, certificate-issuing tool a red team can actually run.
+Built for a PRISM AI-safety fellowship team project on biologically grounded adversarial robustness of protein foundation models. It is the applied successor to `bioplausibility_scoring`, which separated *bioplausibility* from *functional viability* as scores; this framework turns that separation into a tiered, certificate-issuing tool a red team can actually run.
 
 This is defensive research: the point is to characterize which edits survive real biophysical constraint, so safety filters can be evaluated against something better than surface plausibility.
 
